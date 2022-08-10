@@ -14,7 +14,7 @@ Data for historical ticker prices
 
 Congressional Member metadata
  1. https://projects.propublica.org/api-docs/congress-api/
- 2. Key: z7YTk9TlqV7c6CnCPYfZKpeWbL8D8bsmldik4dLI
+ 2. Key: Censored
  3. Pulled using a curl script
 
 ## Gathering all data
