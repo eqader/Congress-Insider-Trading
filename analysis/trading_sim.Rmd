@@ -1,0 +1,218 @@
+---
+title: "MGT_6203 - Group Project - Trading Simulator"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(plotly)
+library(dplyr)
+library(tidyr)
+library(xts)
+library(PerformanceAnalytics)
+library(tidyquant)
+
+
+```
+
+
+
+```{r}
+#Grab trades and stock prices from csv. 
+#Keep only the necessary columns in the prices data.
+orders <- read.csv("analysis/data/all_trades_ammended.csv") %>%
+  mutate(trans_date = as.Date(trans_date)) %>%
+  filter(Representative != "Madison Cawthorn") %>%
+  filter(Representative != "Dan Crenshaw") %>%
+  filter(Representative != "Austin Scott")
+prices <- read.csv("analysis/data/all_prices.csv") %>%
+  select(c("symbol", "date", "adjusted"))
+
+# Make symbols into columns. Fill prices down (forward in time), then up (backward).
+prices <- prices %>%
+  pivot_wider(date, names_from = symbol, values_from = adjusted)
+prices <- prices %>%
+  fill(names(prices)) %>%
+  fill(names(prices), .direction = "up")
+
+# Get list of everyone
+people <- unique(orders$Representative)
+
+# Get baseline SP500 prices
+gspc_base <- tq_get(c("^GSPC"), get="stock.prices", from=as.Date("2016-01-04"))
+
+
+write_csv(prices, "data/prices_xts.csv")
+
+
+```
+
+
+Create new column "signed_shares" that is positive for buys and negative for sells.
+```{r}
+signed_orders <- orders %>%
+  mutate(signed_shares = if_else(orders$Transaction == "Purchase", orders$Amount, orders$Amount * (-1)))
+
+```
+
+
+## Building Alphas
+
+```{r}
+alphas = data.frame(congress = character(),
+                    alphas = double()) 
+
+for (i in 1:length(people)){
+  person=people[i]
+
+  person_orders <- signed_orders %>%
+    filter(Representative == person)
+  
+  person_symbols <- unique(person_orders$Ticker)
+  
+  # pull out relevant prices, add cash column with value of 1, since $1 = $1
+  person_prices <- prices %>%
+    select(c("date", all_of(person_symbols))) %>%
+    mutate(CASH = 1.0)
+  
+  
+  # convert to xts with date index
+  person_prices <- xts(select(person_prices, -c("date")), order.by = as.Date(person_prices$date))
+  
+
+  # Set up matrix of trades.
+  trades <- person_prices
+  trades[] = 0.0
+  
+  for (row in 1:nrow(person_orders)){
+    date <- as.Date(person_orders[row, "trans_date"])
+    symbol <- person_orders[row, "Ticker"]
+    trades[date, symbol] <- trades[date, symbol] + 
+      ((person_orders[row, "signed_shares"]%/%person_prices[date, symbol])+1)
+    trades[date, "CASH"] <- trades[date, "CASH"] + 
+      ((person_orders[row, "signed_shares"]%/%person_prices[date, symbol])+1) * person_prices[date, symbol]*(-1)
+  }
+
+  # Sum matrix of trades to get cumulative holdings in cash and shares.
+  holdings <- vapply(trades, cumsum, FUN.VALUE = numeric(nrow(trades)))
+  holdings.xts <- xts(holdings, order.by = index(trades))
+
+  
+  min_assets <- vapply(holdings.xts, min, FUN.VALUE = 1)
+  min_assets[min_assets>0] <- 0
+  
+  trades["2016-01-04",] = min_assets * (-1)
+  
+  holdings <- vapply(trades, cumsum, FUN.VALUE = numeric(nrow(trades)))
+  holdings.xts <- xts(holdings,order.by = index(trades))
+  # Get values in dollars
+  holdings_dollars <- person_prices * holdings
+
+
+  # Sum across to get total portfolio value by date
+  portvals <- xts(rowSums(holdings_dollars), order.by = index(person_prices))
+
+
+  start_date = min(as.Date(person_orders$trans_date))
+  
+  gspc <- gspc_base %>%
+    filter(date >= start_date)
+  
+  gspc_rets <- gspc %>% 
+    tq_transmute(select = adjusted, mutate_fun = periodReturn, period = "daily") %>%
+
+    select(c("daily.returns"))
+
+  gspc_rets <-gspc_rets %>%
+    xts(order.by = as.Date(head(gspc, n= nrow(gspc)-1)$date))
+
+  trimmed_pvals <- window(portvals, start = start_date)
+  daily_returns <- Return.calculate(trimmed_pvals)
+  
+  chart.CumReturns(daily_returns, plot.engine = "plotly")
+  
+  portfolio_alpha <- CAPM.alpha(daily_returns, gspc_rets)
+  
+  alphas[nrow(alphas) + 1,] <- c(person, portfolio_alpha)
+}
+```
+
+
+## Single Person
+```{r}
+
+person="Tommy Tuberville"
+
+
+person_orders <- signed_orders %>%
+  filter(Representative == person)
+
+person_symbols <- unique(person_orders$Ticker)
+
+# pull out relevant prices, add cash column with value of 1, since $1 = $1
+person_prices <- prices %>%
+  select(c("date", all_of(person_symbols))) %>%
+  mutate(CASH = 1.0)
+
+
+# convert to xts with date index
+person_prices <- xts(select(person_prices, -c("date")), order.by = as.Date(person_prices$date))
+
+# Set up matrix of trades.  **Should this be vectorized? I may need help if so.**
+trades <- person_prices
+trades[] = 0.0
+
+for (row in 1:nrow(person_orders)){
+  date <- as.Date(person_orders[row, "trans_date"])
+  symbol <- person_orders[row, "Ticker"]
+  trades[date, symbol] <- trades[date, symbol] + 
+    ((person_orders[row, "signed_shares"]%/%person_prices[date, symbol])+1)
+  trades[date, "CASH"] <- trades[date, "CASH"] + 
+    ((person_orders[row, "signed_shares"]%/%person_prices[date, symbol])+1) * person_prices[date, symbol]*(-1)
+}
+
+# Sum matrix of trades to get cumulative holdings in cash and shares.
+holdings <- vapply(trades, cumsum, FUN.VALUE = numeric(nrow(trades)))
+holdings.xts <- xts(holdings,order.by = index(trades))
+
+min_assets <- vapply(holdings.xts, min, FUN.VALUE = 1)
+min_assets[min_assets>0] <- 0
+
+trades["2016-01-04",] = min_assets * (-1)
+
+holdings <- vapply(trades, cumsum, FUN.VALUE = numeric(nrow(trades)))
+holdings.xts <- xts(holdings,order.by = index(trades))
+# Get values in dollars
+holdings_dollars <- person_prices * holdings
+
+# Sum across to get total portfolio value by date
+portvals <- xts(rowSums(holdings_dollars), order.by = index(person_prices))
+
+start_date = min(as.Date(person_orders$trans_date))
+
+gspc <- gspc_base %>%
+  filter(date >= start_date)
+
+gspc_rets <- gspc %>% 
+  tq_transmute(select = adjusted, mutate_fun = periodReturn, period = "daily") %>%
+  select(c("daily.returns")) %>%
+
+  xts(order.by = as.Date(head(gspc, n=nrow(gspc)-1)$date))
+
+
+trimmed_pvals <- window(portvals, start = start_date)
+daily_returns <- Return.calculate(trimmed_pvals)
+
+chart.CumReturns(daily_returns, plot.engine = "plotly",wealth.index = FALSE)
+
+CAPM.alpha(daily_returns, gspc_rets)
+
+```
+
+
+```{r}
+write.csv(holdings, "data/holdings.csv")
+write.csv(holdings_dollars, "data/holdings_dollars.csv")
+write.csv(signed_orders, "data/signed_orders.csv")
+
+```
+

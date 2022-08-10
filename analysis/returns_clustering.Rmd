@@ -1,0 +1,190 @@
+---
+title: "Returns Clustering"
+---
+
+```{r setup, include=FALSE}
+library(ggforce)
+library(tidyverse)
+library(tidyquant)
+library(xts)
+library(fpc)
+library(dbscan)
+library(cluster)
+library(random)
+
+
+
+```
+
+
+```{r data import}
+trade_returns <- read.csv("data/returns_by_trade.csv")
+
+```
+
+```{r Create Different Sets of Data}
+trade_returns$Representative <- as.factor(trade_returns$Representative)
+trade_returns$Ticker <- as.factor(trade_returns$Ticker)
+trade_returns$tradevol <- as.numeric(trade_returns$tradevol) / mean(as.numeric(trade_returns$tradevol))
+trade_returns$Amount <- trade_returns$Amount/mean(trade_returns$Amount)
+trade_returns <- trade_returns %>%
+  mutate(excess_return_30 = thirtydayrets - marketreturnthirty)
+
+
+returns_data <- trade_returns %>%
+  select(-c(trans_date, Ticker, Representative, Transaction))
+
+
+sale_returns <- trade_returns %>%
+  filter(Transaction == "Sale")
+
+purchase_returns <- trade_returns %>%
+  filter(Transaction == "Purchase")
+
+member_sales <- sale_returns %>%
+  drop_na()
+
+member_purchases <- purchase_returns %>%
+  drop_na()
+
+dput(member_purchases, file="../final_report/all_member_purchases.R")
+dput(member_sales, file="../final_report/all_member_sales.R")
+
+summary(member_purchases)
+
+```
+
+
+
+```{r}
+
+
+
+member_purchases_c <- member_purchases %>%
+  select(thirtydayrets, marketreturnthirty, prev30days, prev30market)
+
+
+optics_cl <- optics(member_purchases_c, minPts = 10)
+
+
+
+```
+
+```{r}
+
+
+
+dbs <- extractDBSCAN(optics_cl, eps_cl = 0.2)
+plot(dbs)
+hullplot(member_purchases_c, dbs, main = "DBSCAN")
+dput(dbs, file="dbs_purchases.R")
+dput(member_purchases_c, file="member_purchases_hullplot.R")
+
+```
+
+```{r}
+
+member_purchase_outliers <- member_purchases %>%
+  mutate(cluster = dbs$cluster) %>%
+  filter(cluster != 1)
+
+dput(member_purchase_outliers,file = 'purchase_outliers.R')
+
+```
+
+
+
+## Member Sales
+
+```{r}
+
+member_sales_c <- member_sales %>%
+  select(thirtydayrets, marketreturnthirty, prev30days, prev30market)
+
+optics_cl <- optics(member_sales_c, minPts = 10)
+
+```
+
+```{r}
+
+
+
+dbs <- extractDBSCAN(optics_cl, eps_cl = 0.17)
+plot(dbs)
+hullplot(member_sales_c, dbs, main = "DBSCAN")
+dput(dbs, file="dbs_sales.R")
+dput(member_sales_c, file="member_sales_hullplot.R")
+
+```
+
+
+
+
+```{r}
+member_sales_outliers <- member_sales %>%
+  mutate(cluster = dbs$cluster) %>%
+  filter(cluster != 1)
+
+dput(member_sales_outliers,file = 'sale_outliers.R')
+
+
+```
+
+```{r}
+
+best_purchases <- member_purchases %>%
+  filter(excess_return_30 >0)
+
+best_purchase_counts <- best_purchases %>%
+  count(Representative)
+
+total_purchases <-member_purchases %>%
+  count(Representative)
+
+best_purchasers <- best_purchase_counts %>%
+  rename("purchase_count" = "n") %>%
+  left_join(total_purchases, by="Representative") %>%
+  rowwise() %>%
+  mutate(percent =  purchase_count/n) %>%
+  filter(n > 50) %>%
+  filter(percent > 0.5) %>%
+  arrange(desc(percent))
+
+dput(best_purchasers, file="../final_report/best_purchasers.R")
+
+purchases_beat_market <- member_purchases %>%
+  filter(excess_return_30 > 0)
+
+```
+
+```{r}
+
+total_sales <- member_sales %>%
+  count(Representative) %>%
+  rename("sale_count" = "n")
+sales_beat_market <- member_sales %>%
+  filter(excess_return_30 < 0)
+
+# percentage of sales beating the market
+nrow(sales_beat_market)/nrow(member_sales)
+
+# percentage of purchases beating the market
+nrow(purchases_beat_market)/nrow(member_purchases)
+
+
+best_sellers <- member_sales %>%
+  filter(excess_return_30 < 0) %>%
+  count(Representative) %>%
+  left_join(total_sales, by="Representative") %>%
+  rowwise() %>%
+  mutate(percent = n/sale_count) %>%
+  filter(n >30) %>%
+  filter(percent > 0.5) %>%
+  arrange(desc(percent))
+
+dput(best_sellers, file="../final_report/best_sellers.R")
+
+```
+
+
+

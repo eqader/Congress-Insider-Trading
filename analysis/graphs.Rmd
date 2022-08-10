@@ -1,0 +1,1186 @@
+---
+title: "Untitled"
+author: "Bryce Meyering"
+date: '2022-03-15'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+source('./scripts/custom_functions.R')
+
+check_packages(c('tidyverse',
+                 'lubridate',
+                 'data.table',
+                 'plotly',
+                 'Matrix',
+                 'sparsepca',
+                 'cluster',
+                 'skmeans',
+                 'lsa',
+                 'qlcMatrix',
+                 'knitr',
+                 'dbscan',
+                 'ggforce',
+                 'vegan',
+                 'igraph'))
+
+set.seed(123)
+```
+
+```{r data import and cleaning, echo = FALSE, message = FALSE, error=FALSE, warning=FALSE}
+
+# Call data import only if needed
+if(!('price_list'%in%ls())){
+       source('scripts/data_import_and_cleaning.R') 
+}
+
+```
+
+## Exploratory Analysis
+
+We've imported all of the metadata for each congressional member (House, party, etc.), the trading disclosures downloaded from the QuiverQuant API, as well as the stock data pulled using tidyquant. I added the following columns: `report_lag` and `overdue`, which is the amount of days after the transaction that the disclosure was made, and the amount that the lag is "overdue", i.e. past the 45 day limit. We'll take a glimpse at a few random rows from the dataset below:
+
+```{r data head,echo=FALSE}
+sample_ind = sample(nrow(trades), size = 10, replace = FALSE)
+kable(trades[sample_ind,], row.names = FALSE)
+
+```
+
+### Identifying the Worst Offenders of the STOCK ACT
+
+Disclosing a stock transaction after the 45 day imposed requirement should be a red flag as we might find that those who are engaged in 'suspicious' trading would be unwilling to report a transaction right away. Then again, we may find that someone who has acted on insider information would be more willing to abide by the rules so that their behavior wouldn't seem suspicious at all. In any event, lets look at the average reporting lags for each of the congressional members.
+
+```{r member_lag, echo = FALSE, warning=FALSE, fig.width=10, fig.height=8}
+lag <- trades %>% 
+  group_by(Representative, party, House) %>% 
+  summarise(mean_lag = mean(report_lag), 
+            sd_lag = sd(report_lag, na.rm = TRUE),
+            trades = n(),
+            .groups = 'keep')
+
+p1 <- ggplot(lag[lag$mean_lag>45,], aes(x = reorder(Representative, -mean_lag), y = mean_lag))+
+        geom_point(size = 3, color = 'blue', alpha = .7)+
+        geom_errorbar(aes(ymin = mean_lag - sd_lag, ymax = mean_lag+sd_lag))+
+        theme(axis.text.x = element_text(angle = 90, vjust = 0.5))+
+        labs(title = 'Average Reporting Delays\nof Consistently Delinquent Congressional Members',
+             x = 'Member',
+             y = 'Days After Transaction')+
+        geom_hline(yintercept = 45, linetype = 'dashed', color = 'red')
+
+
+ggplotly(p1)
+```
+
+There are not only quite a few congressional members who are consistently delinquent in reporting, but also many who are **very** delinquent. We might conjecture that there is a relationship between the delinquency of a member and how frequently they trade.
+
+```{r party_lag, echo = FALSE, warning=FALSE}
+plag <- trades %>% 
+  group_by(party) %>% 
+  summarise(mean_lag = mean(report_lag, na.rm = TRUE), 
+            sd_lag = sd(report_lag, na.rm = TRUE),
+            trades = n(),
+            .groups = 'keep')
+
+temp <- ggplot(plag, aes(x = reorder(party, -mean_lag), y = mean_lag))+
+        geom_point(size = 3, color = 'blue', alpha = .7)+
+        geom_errorbar(aes(ymin = mean_lag - sd_lag, ymax = mean_lag+sd_lag))+
+        theme(axis.text.x = element_text(angle = 90, vjust = 0.5))+
+        labs(title = 'Average Reporting Delays by Party',
+             x = 'Party',
+             y = 'Days After Transaction')+
+        geom_hline(yintercept = 45, linetype = 'dashed', color = 'red')
+
+
+ggplotly(temp)
+
+
+temp1 <- ggplot(trades, aes(x = party, y = log(report_lag), text = report_lag, fill = party))+
+        geom_violin(alpha = .5)+
+        geom_hline(yintercept = log(45), linetype = 'dashed', color = 'black')+
+        scale_fill_manual(values = c('blue', 'red'))+
+        facet_wrap(~House)
+
+ggplotly(temp1)
+```
+
+In terms of political parties, the Democrats average almost 10 days longer to report their stocks. Both parties average almost double the mandated 45 day STOCK act deadline.
+
+```{r trade correlation plot, echo = FALSE, warning=FALSE, fig.width=10, fig.height=8}
+p2 <- ggplot(lag, aes(x = trades, y = mean_lag, color = party))+
+        geom_point(size = 4, alpha = .6)+
+        scale_color_manual(values = c('blue', 'red'))+
+        labs(title = 'Member Total Trades Correlation with Reporting Lag',
+             x = 'Number of Transactions Reported',
+             y = 'Reporting Lag (DAT)',
+             color = 'Party')+
+        facet_wrap(~House)
+
+ggplotly(p2)
+```
+
+However, that doesn't seem to be the case. A log transoformation on both of the variables doesnt seem to help either.
+
+```{r log trade correlation plot, echo=FALSE, warning = FALSE, fig.width=10, fig.height=8}
+p3 <- ggplot(lag, aes(x = trades, y = mean_lag, color = party))+
+        geom_point(size = 4, alpha = .6)+
+        scale_color_manual(values = c('blue', 'red'))+
+        labs(title = 'Member Total Trades Correlation with Reporting Lag',
+             x = 'Number of Transactions Reported (Log10 Scaled)',
+             y = 'Reporting Lag (DAT, Log10 Scaled)',
+             color = 'Party')+
+        facet_wrap(~House)+
+        scale_y_log10()+
+        scale_x_log10()
+
+ggplotly(p3)
+```
+
+### Stocks with the Highest Reporting Lags
+
+We could also look at the average reporting lag for individual stocks to see if there are some ticker transactions which people are more likely to report later than others. First, we can sort the tickers in terms of descending mean reporting lag and plot all of the values. I've removed the Ticker labels since they are difficult to display with 800 different tick marks, but the plot is interactive, so zoom in on a section and hover over the points to see the symbol.
+
+```{r ticker reporting lag, echo = FALSE, warning=FALSE, fig.width=10, fig.height=8}
+ticker_lags <- trades %>% 
+        group_by(Ticker) %>% 
+        summarize(mean_lag = mean(report_lag, na.rm = TRUE),
+                  sd_lag = sd(report_lag, na.rm = TRUE),
+                  trans_count = n())
+
+p4 <- ggplot(ticker_lags, aes(x = reorder(Ticker, -mean_lag), y = mean_lag, text = trans_count))+
+        geom_point(color = 'blue')+
+        geom_hline(yintercept = 45, linetype = 'dashed', color = 'red')+
+        labs(title = 'Ordered Average Reporting Lag for All Tickers',
+             x = 'Ticker',
+             y = 'Average Reporting Lag (DAT)')+
+        theme(axis.text.x = element_blank())
+
+ggplotly(p4)
+```
+Interesting for sure. Lets filter it further to see all of those stocks that, on average, were subject to delinquent reporting by congressional members. Lets set a fairly high threshold, 250 DAT, to cut down on the observations.The red dotted line represents the 45 DAT reporting deadline.
+
+```{r subset ordered reporting lag, echo=FALSE, fig.width=10, fig.height=8}
+p5 <-  ggplot(filter(ticker_lags, mean_lag >250), aes(x = reorder(Ticker, -mean_lag), y = mean_lag, text = paste("Transactions: ", trans_count)))+
+        geom_point(color = 'blue', size = 2, alpha = .7)+
+        geom_errorbar(aes(ymin = mean_lag-sd_lag, ymax = mean_lag+sd_lag))+
+        geom_hline(yintercept = 45, linetype = 'dashed', color = 'red')+
+        labs(title = 'Ordered Average Reporting Lag for Tickers with Lag > 250 DAT',
+             x = 'Ticker',
+             y = 'Average Reporting Lag (DAT)')+
+        theme(axis.text.x = element_text(angle = 90, vjust = .5, size = 5))
+ggplotly(p5)
+```
+
+If you hover over the points you can see the average lag associated with each one, however, the transaction count for most of these stocks is also very low. Lets cross-check the top 100 highly delinquent stocks to see if some of theses are the same stocks that are in the 100 most popular across congressional members.
+
+```{r trade delinquency intersection}
+trade_delin_intersection <- ticker_lags %>% 
+        top_n(100, trans_count) %>% 
+        inner_join(ticker_lags %>% 
+                           top_n(100, mean_lag), by = c('Ticker', 'mean_lag', 'sd_lag', 'trans_count'))
+```
+
+```{r trade delinquency kable, echo = FALSE}
+trade_delin_intersection[1,] <- rbind(trade_delin_intersection, data.frame(Ticker = NA, mean_lag = NA, sd_lag = NA, trans_count = NA))
+kable(trade_delin_intersection, row.names = TRUE)
+```
+
+Alas, it seems like there are no overlapping tickers for these subsets of the data.
+
+Take a look at the graphs below. In general the higher the average delinquency of the stock, the lower the transaction count, although the relationship is not linear. We can try to model this later. 
+
+```{r lag by transaction count, echo=FALSE,warning=FALSE, fig.width=10, fig.height=8}
+p6 <- ggplot(ticker_lags, aes(x = trans_count, y = mean_lag))+
+        geom_point(alpha = .5, color = 'blue', size = 2)+
+        scale_color_viridis_c('D')+
+        labs(title = 'Transaction Count Correlation to Mean Reporting Lag',
+             x = 'Transaction Count',
+             y = 'Mean Reporting Lag (DAT)')
+ggplotly(p6)        
+```
+
+The density plot below shows the log scaled reporting lag for both houses and parties. The vertical red lines represent the (log) 45 day reporting deadline. The vast majority of transactions get reported on time, but it seems that there is some disparity between parties at the extreme end, at least for the Senate.
+
+
+```{r report_lag density, echo=FALSE, warning=FALSE, fig.width=10, fig.height=8}
+p7 <- ggplot(trades, aes(x = log(report_lag), fill = party))+
+        geom_density(alpha =.3)+
+        facet_wrap(~House)+
+        geom_vline(xintercept = log(45), linetype = 'dashed', color = 'red')+
+        scale_fill_manual(values = c('blue', 'red'))+
+        labs(title = 'Reporting Lag Density Plot\nBy Party and House',
+             x = 'Reporting Lag (ln(DAT))',
+             y = 'Density',
+             fill = 'Party')
+
+ggplotly(p7)
+```
+
+Let's take a look at the total transaction amounts for each of the tickers in our database that have a total transaction count greater than 50.
+
+```{r ticker transaction counts, echo = FALSE, warning=FALSE, fig.width=10, fig.height=8}
+ticker_popularity <- trades %>% 
+        group_by(Ticker) %>% 
+        count()
+
+p8 <- ggplot(ticker_popularity[ticker_popularity$n >=50,], aes(x = reorder(Ticker, -n), y = n))+
+        geom_point(color = 'blue', size = 3, alpha = .7)+
+        theme(axis.text.x = element_text(angle = 90))+
+        labs(x = 'Ticker', 
+             y = 'Transaction Counts',
+             title = 'Ticker Transaction Counts')
+
+ggplotly(p8)
+```
+
+
+```{r Transaction counts plot, echo=FALSE, message=FALSE, warning=FALSE, fig.width=10, fig.height=8}
+
+
+diff2 <- trades %>% 
+        filter(report_lag >=0)
+
+parties <- trades %>% 
+  group_by(party, Transaction) %>% 
+  count()
+
+ticker_popularity <- trades %>% 
+        group_by(Ticker) %>% 
+        count() %>% 
+        arrange(-n)
+        
+Rep_count <- length(unique(trades$Representative[trades$party == 'R']))
+Dem_count <- length(unique(trades$Representative[trades$party == 'D']))
+
+ggplot(parties, aes(x = Transaction, y = n, group = party, fill = party))+
+  geom_bar(stat = 'identity', position = position_dodge(), alpha = .7, color = 'black')+
+  scale_fill_manual(values = c('blue', 'red'))
+
+parties <- trades %>% 
+  group_by(party, Transaction) %>% 
+  count() %>% 
+  mutate(norm = ifelse(party == 'D', n/Dem_count, n/Rep_count))
+
+ggplot(parties, aes(x = Transaction, y = norm, group = party, fill = party))+
+  geom_bar(stat = 'identity', position = position_dodge(), alpha = .7, color = 'black')+
+  scale_fill_manual(values = c('blue', 'red'))
+```
+
+### Trade Data
+
+
+
+```{r transaction time series, echo=FALSE,warning=FALSE, fig.width=10, fig.height=8}
+date_seq <- seq.Date(from = as.Date('2016-01-01'), to = as.Date('2022-02-02'), by = 1)
+date_grid <- expand.grid(c('Purchase', 'Sale'), date_seq) %>% 
+        rename('Transaction' = 'Var1', 'date' = 'Var2')
+
+date_trades <- trades %>% 
+        group_by(as.character(trans_date), Transaction) %>% 
+        count() %>% 
+        rename('date' = 'as.character(trans_date)') %>% 
+        mutate(date = as.Date(date)) %>% 
+        full_join(date_grid, by = c('date', 'Transaction')) %>% 
+        arrange(date) %>% 
+        mutate(tr_count = ifelse(is.na(n), 0, n)) %>% 
+        filter(date >= as.Date('2016-01-01'))
+```
+
+```{r transaction time plot, echo=FALSE, warning=FALSE, fig.width=10, fig.height=8}
+
+p11 <- ggplot(date_trades, aes(x=date, y = tr_count, group = Transaction, color = Transaction))+
+        geom_point(size = 1, alpha = .3)+
+        geom_line(alpha = .6)+
+        geom_hline(yintercept = 12.96, linetype = 'dashed', color = 'red')+
+        scale_x_date(breaks = function(x) seq.Date(from = min(x),
+                                                   to = max(x),
+                                                   by = '3 months'),
+                     minor_breaks = function(x) seq.Date(from = min(x),
+                                                         to = max(x),
+                                                         by = 'week'))+
+        theme(axis.text.x = element_text(angle = 90))+
+        scale_color_viridis_d(option = 'D', begin = .4, end = .8)+
+        labs(title = 'Transaction Events Over Time',
+             x = 'Date',
+             y = 'Transaction Count')
+
+ggplotly(p11)
+
+```
+
+```{r, echo=FALSE, warning=FALSE, fig.width=10, fig.height=8}
+date_amounts <- trades %>% 
+        group_by(as.character(trans_date), Transaction) %>% 
+        summarize(amount = sum(Amount, na.rm = TRUE)) %>% 
+        rename('date' = 'as.character(trans_date)') %>% 
+        mutate(date = as.Date(date)) %>% 
+        full_join(date_grid, by = c('date', 'Transaction')) %>% 
+        arrange(date) %>% 
+        mutate(tr_amount = ifelse(is.na(amount), 0, amount),
+               tr_amount = ifelse(Transaction == 'Sale', tr_amount*(-1), tr_amount)) %>% 
+        filter(date >= as.Date('2016-01-01'))
+
+p12 <- ggplot(date_amounts, aes(x=date, y = tr_amount/1000000, group = Transaction, color = Transaction))+
+        geom_point(size = 2, alpha = .3)+
+        geom_line(alpha = .6)+
+        geom_hline(yintercept = 12.96/1000000, linetype = 'dashed', color = 'red')+
+        scale_x_date(breaks = function(x) seq.Date(from = min(x),
+                                                   to = max(x),
+                                                   by = '3 months'),
+                     minor_breaks = function(x) seq.Date(from = min(x),
+                                                         to = max(x),
+                                                         by = 'week'))+
+        theme(axis.text.x = element_text(angle = 90))+
+        scale_color_viridis_d(option = 'D', begin = .4, end = .8)+
+        labs(title = 'Transaction Dollar Amounts Over Time',
+             x = 'Date',
+             y = 'Transaction Amount (Million USD)')
+
+ggplotly(p12)
+
+```
+
+
+
+### Sparse Matrix Construction and Scaling
+
+We can try to identify some preliminary clusters of trading members by the securities that they have invested in over the timeframe we have data for. Let's start with a simple unweighted matrix with a `1` for each security has held and a `0` for each security they have not held. Since our values are binary and we don't want to destroy the sparsity of the matrix, we will not center or scale the data at all.
+
+```{r A1 unweighted tickers sparse matrix construction}
+trading_members <- unique(trades$Representative)
+
+i<- c()
+j <- c()
+x <- c()
+
+for(ind in 1:length(trading_members)){
+        df <- filter(trades, Representative == trading_members[ind])
+        unique_tickers <- unique(df$Ticker)
+        j_ind <- which(tickers %in% unique_tickers)
+        i_ind <- rep(ind, times = length(j_ind))
+        values <- rep(1, times = length(j_ind))
+        i <- c(i, i_ind)
+        j <- c(j, j_ind)
+        x <- c(x, values)
+}
+
+A1 <- sparseMatrix(i, j, x = x)
+```
+
+Our matrix has 167 rows and 818 columns which corresponds to the number of trading members and unique tickers, respectively.
+Let's check out the structure of `A1`.
+```{r A1 structure}
+str(A1)
+```
+
+We can create another sparse matrix with the number of transactions a member has made for each stock expressed as a proportion of each members total transaction count. The nonzero elements in each column of data will be extracted, zero centered, and scaled such that the mean of each column is a near-zero value while still maintaining sparsity.
+
+```{r A2 member transaction count proportion sparse matrix}
+member_totals <- trades %>% 
+        group_by(Representative) %>% 
+        summarise(total_count = n())
+
+member_trades <- trades %>% 
+        group_by(Representative, Ticker) %>% 
+        summarize(n = n()) %>% 
+        left_join(member_totals, by = "Representative") %>% 
+        rowwise() %>% 
+        mutate(pr_trans = n/total_count)
+        
+
+i<- c()
+j <- c()
+x <- c()
+
+for(ind in 1:length(trading_members)){
+        df <- filter(member_trades, Representative == trading_members[ind])
+        unique_tickers <- unique(df$Ticker)
+        j_ind <- which(trade_tickers %in% unique_tickers)
+        i_ind <- rep(ind, times = length(j_ind))
+        values <- df$pr_trans
+        i <- c(i, i_ind)
+        j <- c(j, j_ind)
+        x <- c(x, values)
+}
+
+A2 <- sparseMatrix(i, j, x = x)
+
+for(i in 1:ncol(A2)){
+        vec = A2[,i]
+        ind <- which(vec != 0)
+        subset = vec[ind]
+        minv = min(subset)
+        maxv = max(subset)
+        if(length(subset)>1&sd(subset)>0){
+                #A2[ind,i] <- (subset-minv)/(maxv-minv)*(2)-1
+                A2[ind,i] <- scale(subset)
+        } else if(length(subset)>1&sd(subset)==0){
+                A2[ind,i] <- 1
+        } else if(length(subset)==1&all(subset>1)){
+                A2[ind,i] <- 1
+        } 
+}
+```
+
+Then we can create a sparse matrix with each stocks' proportion of the total transaction amount (purchase and sale) for each members portfolio. The non-zero elements in each column will be scaled accordingly as described above.
+
+```{r A3 member transaction amount proportion weighted sparse matrix}
+member_totals <- trades %>% 
+        group_by(Representative) %>% 
+        summarize(total_amt = sum(Amount))
+
+
+member_ticker_weights <- trades %>% 
+        group_by(Representative, Ticker) %>% 
+        summarize(ticker_amt = sum(Amount)) %>% 
+        full_join(member_totals, by = 'Representative') %>% 
+        rowwise() %>% 
+        mutate(pr_weight = ticker_amt/total_amt)
+
+i<- c()
+j <- c()
+x <- c()
+
+for(ind in 1:length(trading_members)){
+  df <- filter(member_ticker_weights, Representative == trading_members[ind])
+  unique_tickers <- unique(df$Ticker)
+  j_ind <- which(trade_tickers %in% unique_tickers)
+  i_ind <- rep(ind, times = length(j_ind))
+  values <- df$pr_weight
+  i <- c(i, i_ind)
+  j <- c(j, j_ind)
+  x <- c(x, values)
+}
+
+A3 <- sparseMatrix(i, j, x = x)
+
+for(i in 1:ncol(A3)){
+        vec = A3[,i]
+        ind <- which(vec != 0)
+        subset = vec[ind]
+        maxv = max(vec)
+        minv = min(vec)
+        if(length(subset)!=1&sd(subset)!=0)
+                #A3[ind,i] <- (subset-minv)/(maxv-minv)*2 - 1
+                A3[ind,i] <- scale(subset)
+}
+```
+
+Next, we'll create sparse representations of the data from a date perspective. For each date that a member made a transaction, we will include a proportional value of their total transactions on that day relative to the total value of all transactions that member made on all days they had transactions. Columns will be centered and scaled.
+```{r A4 date transactions sparse matrix}
+
+date_set <- unique(trades$trans_date)
+
+
+i<- c()
+j <- c()
+x <- c()
+
+for(ind in 1:length(trading_members)){
+        df <- filter(trades, Representative == trading_members[ind]) %>% 
+                group_by(trans_date) %>% 
+                summarize(total_amount = sum(Amount),
+                          count = n(),
+                          avg_trans = total_amount/count)
+        total <- sum(df$total_amount)
+        df$prop <- df$total_amount/total
+        unique_dates <- unique(df$trans_date)
+        j_ind <- which(date_set %in% unique_dates)
+        i_ind <- rep(ind, times = length(j_ind))
+        values <- df$prop
+        i <- c(i, i_ind)
+        j <- c(j, j_ind)
+        x <- c(x, values)
+}
+
+A4 <- sparseMatrix(i, j, x = x)
+
+for(i in 1:ncol(A4)){
+        vec = A4[,i]
+        ind <- which(vec != 0)
+        subset = vec[ind]
+        maxv = max(vec)
+        minv = min(vec)
+        if(length(subset)!=1&sd(subset)!=0)
+                A4[ind,i] <- scale(subset)
+                #A4[ind,i] <- (subset-minv)/(maxv-minv)
+        else if(length(subset)!=1&sd(subset)==0)
+                A4[ind,i] <- 1
+        else if(length(subset)==1)
+                A4[ind,i] <- 1
+}
+```
+
+Matrix A5 shown below is the total number of transactions each member every day as a proportion of the total number of transactions they made over the data period. Columns will be centered and scaled.
+
+```{r A5 date transactions sparse matrix}
+
+date_set <- unique(trades$trans_date)
+
+
+i<- c()
+j <- c()
+x <- c()
+
+for(ind in 1:length(trading_members)){
+        df <- filter(trades, Representative == trading_members[ind]) %>% 
+                group_by(trans_date) %>% 
+                count()
+        total_trades <- sum(df$n)
+        df$prop_trades <- df$n/total_trades
+        unique_dates <- unique(df$trans_date)
+        j_ind <- which(date_set %in% unique_dates)
+        i_ind <- rep(ind, times = length(j_ind))
+        values <- df$prop_trades
+        i <- c(i, i_ind)
+        j <- c(j, j_ind)
+        x <- c(x, values)
+}
+
+A5 <- sparseMatrix(i, j, x = x)
+
+for(i in 1:ncol(A5)){
+        vec = A5[,i]
+        ind <- which(vec != 0)
+        subset = vec[ind]
+        maxv = max(vec)
+        minv = min(vec)
+        if(length(subset)!=1&sd(subset)!=0)
+                A5[ind,i] <- scale(subset)
+                #A5[ind,i] <- (subset-minv)/(maxv-minv)
+        else if(length(subset)!=1&sd(subset)==0)
+                A5[ind,i] <- 1
+        else if(length(subset)==1)
+                A5[ind,i] <- 1
+}
+```
+
+
+Finally, our last matrix records the total number of all transactions for each member on every day that they made a transaction. Then the nonzero elements were centered and scaled accordingly.
+
+```{r A6 date amount sparse matrix}
+i<- c()
+j <- c()
+x <- c()
+
+for(ind in 1:length(trading_members)){
+        df <- filter(trades, Representative == trading_members[ind]) %>% 
+                group_by(trans_date) %>% 
+                summarize(total_amount = sum(Amount))
+        unique_dates <- unique(df$trans_date)
+        j_ind <- which(date_set %in% unique_dates)
+        i_ind <- rep(ind, times = length(j_ind))
+        values <- df$total_amount
+        i <- c(i, i_ind)
+        j <- c(j, j_ind)
+        x <- c(x, values)
+}
+
+A6 <- sparseMatrix(i, j, x = x)
+
+for(i in 1:ncol(A6)){
+        vec = A6[,i]
+        ind <- which(vec != 0)
+        subset = vec[ind]
+        maxv = max(vec)
+        minv = min(vec)
+        if(length(vec[ind])!=1&sd(vec[ind])!=0)
+                A6[ind,i] <- scale(subset)
+                #A6[ind,i] <- (subset-minv)/(maxv-minv)
+        else if(length(subset)!=1&sd(subset)==0)
+                A6[ind,i] <- 1
+        else if(length(subset)==1)
+                A6[ind,i] <- 1
+}
+```
+
+
+
+### Dimensionality Reduction with SparseSVD
+
+When working with sparse matrices, there isn't always a clear cut way to reduce the dimensionality. We tried several of the algorithms from the `sparsepca` package, but found that they were a bit slow and the results were not always meaningful in terms of our datasets. Instead, we used the `sparsesvd` function from the package of the same name. The first twenty principal components were calculated and we ran the DBSCAN algorithm on only these components. For DBSCAN, we set the `minPts` argument to `n+1` and used a KNN distplot to pick a decent value for $\epsilon$
+
+
+```{r A1 sparsesvd, echo=FALSE, warning=FALSE, fig.width=10, fig.height=8}
+A1svd <- sparsesvd(A1)
+A1u <- A1svd$u
+A1v <- A1svd$v
+A1d <- A1svd$d
+
+A1spc <- A1%*%A1v[,1:20]
+
+wss <- c()
+for(i in 1:20){
+        km <- skmeans(matrix(A1spc, nrow =167), k = i, method = 'pclust')
+        ss <- km$value
+        wss <- c(wss, ss)
+}
+
+plot(wss)
+
+A1km <- skmeans(matrix(A1spc, nrow =167), k = 5, method = 'pclust')
+A1km_naive <-kmeans(matrix(A1spc, nrow = 167), centers = 5)
+
+
+A1knn <- sort(kNNdist(A1spc, 20)) # 5 seems like a good cutoff point as the distance increases drastically after this.
+A1distplot <- ggplot()+
+        geom_line(aes(x = 1:length(A1knn), y = A1knn), color = 'blue', size = 1)+
+        labs(title = 'Matrix A1 - kNN Distance Plot',
+             x = 'Sample Points Sorted By Distance',
+             y = '20-NN Distance')+
+        geom_hline(yintercept = 5, color = "black", size = 1, linetype = 'dashed')
+
+ggplotly(A1distplot)
+
+A1clust <- dbscan(A1spc, eps = 5, minPts = 21) # set minPts to n+1 (number of features+1)
+A1_members <- data.frame(member = trading_members, cluster = A1clust$cluster)
+
+```
+
+
+```{r}
+A1knplot <- ggplot(as.data.frame(as.matrix(A1spc)), aes(x = V1, y = V2, color = factor(A1km_naive$cluster),text = trading_members))+
+        geom_point(alpha=.8)+
+        scale_color_viridis_d(option = 'D', begin = .4, end = .8)+
+        labs(x = 'sPC1',
+             y = 'sPC2',
+             color = 'Kmeans\nCluster',
+             title = 'A1 - Portfolio sPCA with K-means Clustering')
+
+ggplotly(A1knplot)
+
+
+A1kplot <- ggplot(as.data.frame(as.matrix(A1spc)), aes(x = V1, y = V2, color = factor(A1km$cluster),text = trading_members))+
+        geom_point(alpha=.8)+
+        scale_color_viridis_d(option = 'D', begin = .4, end = .8)+
+        labs(x = 'sPC1',
+             y = 'sPC2',
+             color = 'sK-means\nCluster',
+             title = 'A1 - Portfolio sPCA with Spherical K-means Clustering')
+
+ggplotly(A1kplot)
+
+
+
+A1plot <- ggplot(as.data.frame(as.matrix(A1spc)), aes(x = V1, y = V2, color = factor(A1clust$cluster),text = trading_members))+
+        geom_point(alpha=.8)+
+        scale_color_viridis_d(option = 'D', begin = .4, end = .8)+
+        labs(x = 'sPC1',
+             y = 'sPC2',
+             color = 'DBSCAN\nCluster',
+             title = 'A1 - Portfolio sPCA')
+        
+ggplotly(A1plot)
+```
+
+
+```{r A2 sparsesvd, echo=FALSE, warning=FALSE, fig.width=10, fig.height=8}
+A2svd <- sparsesvd(A2)
+A2u <- A2svd$u
+A2d <- A2svd$d
+A2v <- A2svd$v
+
+A2spc <- A2%*%A2v[,1:20]
+
+wss <- c()
+for(i in 1:20){
+        km <- skmeans(matrix(A2spc, nrow =167), k = i, method = 'pclust')
+        ss <- km$value
+        wss <- c(wss, ss)
+}
+
+plot(wss)
+
+A2km <- skmeans(matrix(A2spc, nrow =167), k = 5, method = 'pclust')
+
+
+A2knn <- sort(kNNdist(A2spc, 20)) # 5 seems like a good cutoff point as the distance increases drastically after this.
+A2distplot <- ggplot()+
+        geom_line(aes(x = 1:length(A2knn), y = A2knn), color = 'blue', size = 1)+
+        labs(title = 'Matrix A2 - kNN Distance Plot',
+             x = 'Sample Points Sorted By Distance',
+             y = '20-NN Distance')+
+        geom_hline(yintercept = 5, color = "black", size = 1, linetype = 'dashed')
+
+A2distplot
+
+A2clust <- dbscan(A2spc, eps = 5, minPts = 21)
+A2_members <- data.frame(member = trading_members, cluster = A2clust$cluster)
+```
+
+
+```{r}
+A2kplot <- ggplot(as.data.frame(as.matrix(A2spc)), aes(x = V1, y = V2, color = factor(A2km$cluster), text = trading_members))+
+        geom_point(size = 2, alpha = .6)+
+        scale_color_viridis_d(option = 'D', begin = .4, end = .8)+
+        labs(x = 'sPC1',
+             y = 'sPC2',
+             color = 'kMeans\nCluster',
+             title = 'A2 - Ticker Transaction Count Proportion sPCA')
+
+ggplotly(A2kplot)
+
+
+A2plot <- ggplot(as.data.frame(as.matrix(A2spc)), aes(x = V1, y = V2, color = factor(A2clust$cluster), text = trading_members))+
+        geom_point(size = 2, alpha = .6)+
+        scale_color_viridis_d(option = 'D', begin = .4, end = .8)+
+        labs(x = 'sPC1',
+             y = 'sPC2',
+             color = 'DBSCAN\nCluster',
+             title = 'A2 - Ticker Transaction Count Proportion sPCA')
+
+ggplotly(A2plot)
+
+
+
+```
+
+```{r A3 sparsesvd, echo=FALSE, warning=FALSE, fig.width=10, fig.height=8}
+A3svd <- sparsesvd(A3)
+A3u <- A3svd$u
+A3d <- A3svd$d
+A3v <- A3svd$v
+
+A3spc <- A3%*%A3v[,1:20]
+
+wss <- c()
+for(i in 1:20){
+        km <- skmeans(matrix(A3spc, nrow =167), k = i, method = 'pclust')
+        ss <- km$value
+        wss <- c(wss, ss)
+}
+
+plot(wss)
+
+A3km <- skmeans(matrix(A3spc, nrow =167), k = 7, method = 'pclust')
+
+A3knn <- sort(kNNdist(A3spc, 20)) # 5 seems like a good cutoff point as the distance increases drastically after this.
+A3distplot <- ggplot()+
+        geom_line(aes(x = 1:length(A3knn), y = A3knn), color = 'blue', size = 1)+
+        labs(title = 'Matrix A3 - kNN Distance Plot',
+             x = 'Sample Points Sorted By Distance',
+             y = '20-NN Distance')+
+        geom_hline(yintercept = 5, color = "black", size = 1, linetype = 'dashed')
+
+A3distplot
+
+A3clust <- dbscan(A3spc, eps = 5, minPts = 21)
+A3_members <- data.frame(member = trading_members, cluster = A3clust$cluster)
+```
+
+
+```{r}
+A3kplot <- ggplot(as.data.frame(as.matrix(A3spc)), aes(x = V1, y = V2, color = factor(A3km$cluster), text = trading_members))+
+        geom_point(alpha = .8)+
+        scale_color_viridis_d(option ='D', begin = .4, end = .8)+
+        labs(x = 'sPC1',
+             y = 'sPC2',
+             color = 'kMeans\nCluster',
+             title = 'A3 - Ticker Transaction Amount Proportion sPCA')
+
+ggplotly(A3kplot)
+
+
+A3plot <- ggplot(as.data.frame(as.matrix(A3spc)), aes(x = V1, y = V2, color = factor(A3clust$cluster), text = trading_members))+
+        geom_point(alpha = .8)+
+        scale_color_viridis_d(option ='D', begin = .4, end = .8)+
+        labs(x = 'sPC1',
+             y = 'sPC2',
+             color = 'DBSCAN\nCluster',
+             title = 'A3 - Ticker Transaction Amount Proportion sPCA')
+
+ggplotly(A3plot)
+```
+
+```{r A4 sparsesvd, echo=FALSE, warning=FALSE, fig.width=10, fig.height=8}
+A4svd <- sparsesvd(A4)
+A4u <- A4svd$u
+A4d <- A4svd$d
+A4v <- A4svd$v
+
+A4spc <- A4%*%A4v[,1:20]
+
+wss <- c()
+for(i in 1:20){
+        km <- skmeans(matrix(A4spc, nrow =167), k = i, method = 'pclust')
+        ss <- km$value
+        wss <- c(wss, ss)
+}
+
+plot(wss)
+
+A4km <- skmeans(matrix(A4spc, nrow =167), k = 7, method = 'pclust')
+
+A4knn <- sort(kNNdist(A4spc, 20))
+A4distplot <- ggplot()+
+        geom_line(aes(x = 1:length(A4knn), y = A4knn), color = 'blue', size = 1)+
+        labs(title = 'Matrix A4 - kNN Distance Plot',
+             x = 'Sample Points Sorted By Distance',
+             y = '20-NN Distance')+
+        geom_hline(yintercept = 7, color = "black", size = 1, linetype = 'dashed')
+
+A4distplot
+
+A4clust <- dbscan(A4spc[,1:20], eps = 7, minPts = 21) # 7-8 seem to be good cutoff values
+A4_members <- data.frame(member = trading_members, cluster = A4clust$cluster)
+```
+
+```{r}
+A4kplot <- ggplot(as.data.frame(as.matrix(A4spc)), aes(x = V1, y = V2, color = factor(A4km$cluster), text = trading_members))+
+        geom_point(alpha = .8)+
+        scale_color_viridis_d(option = 'D', begin = .4, end = .8)+
+        labs(x = 'sPC1',
+             y = 'sPC2',
+             color = 'kMeans\nCluster',
+             title = 'A4 - Daily Transactional Value Proportion sPCA')
+ggplotly(A4kplot)
+
+A4plot <- ggplot(as.data.frame(as.matrix(A4spc)), aes(x = V1, y = V2, color = factor(A4clust$cluster), text = trading_members))+
+        geom_point(alpha = .8)+
+        scale_color_viridis_d(option = 'D', begin = .4, end = .8)+
+        labs(x = 'sPC1',
+             y = 'sPC2',
+             color = 'DBSCAN\nCluster',
+             title = 'A4 - Daily Transactional Value Proportion sPCA')
+ggplotly(A4plot)
+```
+
+```{r A5 sparsesvd, echo=FALSE, warning=FALSE, fig.width=10, fig.height=8}
+A5svd <- sparsesvd(A5)
+A5u <- A5svd$u
+A5d <- A5svd$d
+A5v <- A5svd$v
+
+A5spc <- A5%*%A5v[,1:20]
+
+wss <- c()
+for(i in 1:20){
+        km <- skmeans(matrix(A5spc, nrow =167), k = i, method = 'pclust')
+        ss <- km$value
+        wss <- c(wss, ss)
+}
+
+plot(wss)
+
+A5km <- skmeans(matrix(A5spc, nrow =167), k = 7, method = 'pclust')
+
+A5knn <- sort(kNNdist(A5spc, 20))
+A5distplot <- ggplot()+
+        geom_line(aes(x = 1:length(A5knn), y = A5knn), color = 'blue', size = 1)+
+        labs(title = 'Matrix A5 - kNN Distance Plot',
+             x = 'Sample Points Sorted By Distance',
+             y = '20-NN Distance')+
+        geom_hline(yintercept = 5, color = "black", size = 1, linetype = 'dashed')
+
+A5distplot
+
+A5clust <- dbscan(A5spc[,1:20], eps = 5, minPts = 2)
+A5_members <- data.frame(member = trading_members, cluster = A5clust$cluster)
+```
+
+
+```{r}
+A5kplot <- ggplot(as.data.frame(as.matrix(A5spc)), aes(x = V1, y = V2, color = factor(A5km$cluster),text = trading_members))+
+        geom_point(alpha = .8)+
+        scale_color_viridis_d(option = 'D', begin = .4, end = .8)+
+        labs(x = 'sPC1',
+             y = 'sPC2',
+             color = 'kMeans\nCluster',
+             title = 'A5 - Daily Transactional Count Proportion sPCA')
+
+ggplotly(A5kplot)
+
+A5plot <- ggplot(as.data.frame(as.matrix(A5spc)), aes(x = V1, y = V2, color = factor(A5clust$cluster),text = trading_members))+
+        geom_point(alpha = .8)+
+        scale_color_viridis_d(option = 'D', begin = .4, end = .8)+
+        labs(x = 'sPC1',
+             y = 'sPC2',
+             color = 'DBSCAN\nCluster',
+             title = 'A5 - Daily Transactional Count Proportion sPCA')
+
+ggplotly(A5plot)
+```
+
+```{r A6 sparsesvd, echo=FALSE, warning=FALSE, fig.width=10, fig.height=8}
+A6svd <- sparsesvd(A6)
+A6u <- A6svd$u
+A6d <- A6svd$d
+A6v <- A6svd$v
+
+A6spc <- A6%*%A6v[,1:20]
+
+wss <- c()
+for(i in 1:20){
+        km <- skmeans(matrix(A6spc, nrow =167), k = i, method = 'pclust')
+        ss <- km$value
+        wss <- c(wss, ss)
+}
+
+plot(wss)
+
+A6km <- skmeans(matrix(A6spc, nrow =167), k = 5, method = 'pclust')
+
+A6knn <- sort(kNNdist(A6spc, 20))
+A6distplot <- ggplot()+
+        geom_line(aes(x = 1:length(A6knn), y = A6knn), color = 'blue', size = 1)+
+        labs(title = 'Matrix A6 - kNN Distance Plot',
+             x = 'Sample Points Sorted By Distance',
+             y = '20-NN Distance')+
+        geom_hline(yintercept = 2, color = "black", size = 1, linetype = 'dashed')
+
+A6distplot
+
+A6clust <- dbscan(A6spc, eps = 2, minPts = 2)
+A6_members <- data.frame(member = trading_members, cluster = A6clust$cluster)
+```
+
+
+```{r}
+A6kplot <- ggplot(as.data.frame(as.matrix(A6spc)), aes(x = V1, y = V2, color = factor(A6km$cluster), text = trading_members))+
+        geom_point(alpha = .8)+
+        scale_color_viridis_d(option = 'D', begin = .4, end = .8)+
+        labs(x = 'sPC1',
+             y = 'sPC2',
+             color = 'kMeans\nCluster',
+             title = 'A6 - Daily Transaction Amount sPCA')
+
+ggplotly(A6kplot)
+
+
+A6plot <- ggplot(as.data.frame(as.matrix(A6spc)), aes(x = V1, y = V2, color = factor(A6clust$cluster), text = trading_members))+
+        geom_point(alpha = .6, size = 2)+
+        scale_color_viridis_d(option = 'D', begin = .4, end = .8)+
+        labs(x = 'sPC1',
+             y = 'sPC2',
+             color = 'DBSCAN\nCluster',
+             title = 'A6 - Daily Transaction Amount sPCA')
+
+ggplotly(A6plot)
+```
+
+```{r, cosine similarity}
+cosinesim_calc <- function(sparse_matrix, clusters, id){
+        dim1 <- dim(sparse_matrix)[1]
+        data_df <- data.frame(matrix(cosSparse(t(sparse_matrix)), nrow = dim1, ncol = dim1))
+        colnames(data_df) <- id
+        rownames(data_df) <- id
+        member_df <- data.frame(id = id, cluster = clusters)
+        cl_list <- unique(clusters)
+        
+        res <- list(cos_sim = data_df, members = member_df)
+        dput(res, file = paste('output/', deparse(substitute(sparse_matrix)), '_clustering.R', sep = ''))
+}
+
+cosinesim_calc(A1, A1clust$cluster, id = trading_members)
+cosinesim_calc(A2, A2clust$cluster, id = trading_members)
+cosinesim_calc(A3, A3clust$cluster, id = trading_members)
+cosinesim_calc(A4, A4clust$cluster, id = trading_members)
+cosinesim_calc(A5, A5clust$cluster, id = trading_members)
+cosinesim_calc(A6, A6clust$cluster, id = trading_members)
+
+
+```
+
+
+```{r}
+A1_clustering <- dget('../analysis/output/A1_clustering.R')
+A2_clustering <- dget('../analysis/output/A2_clustering.R')
+A3_clustering <- dget('../analysis/output/A3_clustering.R')
+A4_clustering <- dget('../analysis/output/A4_clustering.R')
+A5_clustering <- dget('../analysis/output/A5_clustering.R')
+A6_clustering <- dget('../analysis/output/A6_clustering.R')
+```
+
+
+
+```{r}
+A1_outliers <- A1_clustering$members %>% 
+        filter(cluster == 0)
+A2_outliers <- A2_clustering$members %>% 
+        filter(cluster == 0)
+A3_outliers <- A3_clustering$members %>% 
+        filter(cluster == 0)
+A4_outliers <- A4_clustering$members %>% 
+        filter(cluster == 0)
+A5_outliers <- A5_clustering$members %>% 
+        filter(cluster == 0)
+A6_outliers <- A6_clustering$members %>% 
+        filter(cluster == 0)
+outlier_members <- unique(c(A1_outliers$id, A2_outliers$id, A3_outliers$id, A4_outliers$id, A5_outliers$id, A6_outliers$id))
+outliers_df <- data.frame(members = outlier_members,
+                          A1 = ifelse(outlier_members %in% A1_outliers$id, 1, 0), 
+                          A2 = ifelse(outlier_members %in% A2_outliers$id, 1, 0),
+                          A3 = ifelse(outlier_members %in% A3_outliers$id, 1, 0),
+                          A4 = ifelse(outlier_members %in% A4_outliers$id , 1, 0),
+                          A5 = ifelse(outlier_members %in% A5_outliers$id, 1, 0),
+                          A6 = ifelse(outlier_members %in% A6_outliers$id, 1, 0)) %>% 
+        rowwise() %>% 
+        mutate(count = sum(c_across(A1:A6), na.rm = T))
+out_plot <- ggplot(outliers_df, aes(x = reorder(members, -count), y = count, fill = factor(count)))+
+        geom_bar(stat = 'identity')+
+        scale_fill_viridis_d(option = 'D', begin = .2, end = .8)+
+        theme(axis.text.x = element_text(angle = 90, vjust=.5))+
+        labs(title = 'Outlier Appearance Count from DBSCAN Clustering',
+             x = 'Congressional Member',
+             y = 'Outlier Flag Count',
+             fill = 'Flag Count')
+
+ggplotly(out_plot)
+
+apply(outliers_df[,2:7], 2, sum)
+
+dput(outliers_df, 'outliers_df.R')
+```
+
+
+```{r}
+mat_list <- list(A1, A2, A3, A4, A5, A6)
+
+res_mat <- matrix(nrow = 167, ncol = 6)
+
+for(i in 1:length(mat_list)){
+        i_ds <- vegdist(mat_list[[i]], 'euc')
+        i_mean <- apply(as.matrix(i_ds), 2, mean)
+        res_mat[,i] <- i_mean
+}
+colnames(res_mat) <- c('A1', 'A2', 'A3', 'A4', 'A5', 'A6')
+res_df <- data.frame(res_mat) %>% 
+        mutate(member = trading_members) %>% 
+        rowwise() %>% 
+        mutate(mean_ds = sum(A1, A2, A3, A4, A5, A6)/6) %>% 
+        select(member, everything())
+
+
+ordered_dis <- res_df[order(-res_df$mean_ds),]
+dput(ordered_dis, 'dissim.R')
+```
+
+```{r delinquent members}
+dnr_mem <- trades %>% 
+        filter(DNR == 1) %>% 
+        group_by(Representative) %>% 
+        summarize(transaction_count = n(),
+                  transaction_amount = sum(Amount))
+
+dput(dnr_mem, 'dnr_mem.R')
+
+del_mem <- trades %>% 
+        filter(report_lag > 45) %>% 
+        group_by(Representative) %>% 
+        summarize(transaction_count = n(),
+                  transaction_amount = sum(Amount),
+                  lag = mean(report_lag)) %>% 
+        arrange(-lag)
+
+dput(del_mem, 'del_mem.R')
+
+```
+
+```{r}
+purchase_outliers <- dget('purchase_outliers.R')
+sale_outliers <- dget('sale_outliers.R')
+
+pout_count <- purchase_outliers %>% 
+        group_by(Representative) %>% 
+        count() %>% 
+        mutate(purchases = 1) %>% 
+        select(-n)
+
+sout_count <- sale_outliers %>% 
+        group_by(Representative) %>% 
+        count() %>% 
+        mutate(sales = 1) %>% 
+        select(-n)
+
+total_outliers <- outliers_df %>% 
+        full_join(pout_count, by = c('members' = 'Representative')) %>% 
+        full_join(sout_count, by = c('members' = 'Representative')) %>% 
+        replace_na(list(A1 = 0, A2 = 0, A3 = 0, A4 = 0, A5 = 0, A6 = 0, purchases = 0, sales = 0)) %>% 
+        select(-count)
+
+
+#create an edge list
+res <- matrix(nrow = 0, ncol = 0)
+
+for(i in 2:ncol(total_outliers)){
+        sub <- total_outliers$members[total_outliers[,i]==1]
+        grid = tidyr::crossing(sub, sub)
+        grid <- grid[grid$sub...1!=grid$sub...2,]
+        print(grid)
+        unq <- unique(grid$sub...1)
+        edges <- grid[1:length(unq)-1,]
+        res <- rbind(res, edges)
+}
+
+
+colnames(res) <- c('source', 'target')
+
+network <- graph_from_data_frame(d=res, directed=F) 
+
+# plot it
+plot(network)
+
+```
+
+
+
+
+
+
+```{r}
+griddf <- as.data.frame(matrix(cosSparse(t(A1)), nrow = 167, ncol = 167))
+#griddf <- data.frame(matrix(cosSparse(t(A2)), nrow = 167, ncol = 167))
+df2 <- data.frame(member = trading_members, cluster = A2clust$cluster)
+d_clust <- unique(A2clust$cluster)
+
+colnames(griddf) <- trading_members
+
+griddf <- griddf %>% 
+        mutate(Rep = trading_members) %>% 
+        select(Rep, everything())
+
+melted <- gather(griddf, key = 'Rep2', value = 'cossim', 2:168) %>% 
+        filter(Rep != Rep2)
+
+
+heatmap <- ggplot(melted, aes(reorder(Rep, -cossim), reorder(Rep2, -cossim), fill = cossim))+
+        geom_tile()+
+        scale_fill_viridis_c(option = 'D')+
+        theme(axis.text = element_blank(),
+              axis.title = element_blank())+
+        labs(fill = 'Cosine\nSimiliarity',
+             title = 'Congressional Member Cosine Similarity Heatmap')
+
+ggplotly(heatmap)
+
+'%!in%' <- Negate('%in%')
+
+
+res_mat <- matrix(data = NA, nrow = length(d_clust), ncol = 3)
+
+for(k in d_clust){
+        print(k)
+        m_vec <- df2$member[df2$cluster == k]
+        ind <- which(griddf$Rep %in% m_vec)
+        col_ind <- which(colnames(griddf) %in% m_vec)
+        
+        df <- griddf[ind,c(1,col_ind)] %>% 
+                gather(key = 'Rep2', value = 'cossim', 2:length(c(1, col_ind))) %>% 
+                filter(Rep != Rep2)
+        
+        col_ind2 <- which(colnames(griddf) %!in% m_vec)
+        
+        non = griddf[ind, col_ind2] %>% 
+                gather(key = 'Rep2', value = 'cossim', 2:length(col_ind2)) %>% 
+                filter(Rep != Rep2)
+        c_vec <- c(k, mean(df$cossim), mean(non$cossim))
+        print(mean(df$cossim))
+        print(mean(non$cossim))
+        
+        res_mat[k+1,] <- c_vec
+}
+
+colnames(res_mat) <- c('cluster', 'wics', 'wocs')
+print(res_mat)
+```
