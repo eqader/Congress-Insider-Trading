@@ -7,7 +7,7 @@ All of the main code to verify our results is located in the 'analysis/' folder 
 All for this project data was pulled from publicly available datasets online.
 Data for congressional trades
  1. https://api.quiverquant.com/
- 2. Auth Token: bd515dcb6fbff4d0462e47c5e3a057a67f8eed8e
+ 2. Auth Token: Censored
 
 Data for historical ticker prices
  1. Pulled using the Tidyquant package in R
